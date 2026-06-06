@@ -313,42 +313,20 @@ function TopicRow({ topic, total, accuracy }: { topic: string; total: number; ac
 
 function SentencePractice({ state, setState }: { state: PracticeState; setState: (state: PracticeState) => void }) {
   const [difficulty, setDifficulty] = useState<DifficultyFilter>("Mixed");
-  const [questionQueue, setQuestionQueue] = useState<SentenceQuestion[]>([]);
   const [question, setQuestion] = useState<SentenceQuestion | null>(null);
   const [answer, setAnswer] = useState("");
   const [submitted, setSubmitted] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [lastResult, setLastResult] = useState<{ correct: boolean; answer: string; explanation: string } | null>(null);
+  const [questionsAnswered, setQuestionsAnswered] = useState(0);
 
   const weakTopics = getTopicStats(state).filter((topic) => topic.accuracy < 60).map((topic) => topic.topic);
   const recentPrompts = state.mistakes.slice(-6).map((mistake) => mistake.prompt);
 
-  function hydrateBatch(items: SentenceQuestion[]) {
-    const normalized = items
-      .filter((item) => item?.prompt && item?.answer)
-      .map((item, index) => ({
-        ...item,
-        id: item.id || uid(`sentence-${index}`),
-      }));
-    setQuestionQueue(normalized);
-    setQuestion(normalized[0] ?? null);
-  }
-
-  function showNextFromQueue(queue: SentenceQuestion[]) {
-    const nextQueue = queue.slice(1);
-    setQuestionQueue(nextQueue);
-    setQuestion(nextQueue[0] ?? null);
-    setAnswer("");
-    setSubmitted(false);
-    setLastResult(null);
-    return nextQueue;
-  }
-
-  async function loadQuestionBatch() {
+  async function loadNextQuestion() {
     setLoading(true);
     setError("");
-    setQuestionQueue([]);
     setQuestion(null);
     setSubmitted(false);
     setAnswer("");
@@ -356,23 +334,19 @@ function SentencePractice({ state, setState }: { state: PracticeState; setState:
     try {
       const generated = await generateJson<{ questions: SentenceQuestion[] }>(
         state.aiSettings,
-        sentencePrompt({ difficulty, weakTopics, recentPrompts, count: 20 }),
+        sentencePrompt({ difficulty, weakTopics, recentPrompts, count: 1 }),
       );
-      hydrateBatch(generated.questions ?? []);
-      if (!(generated.questions ?? []).length) {
-        throw new Error("AI did not return any sentence questions.");
+      const questions = generated.questions ?? [];
+      if (questions.length === 0) {
+        throw new Error("AI did not return a question. Please try again.");
       }
+      const newQuestion = questions[0];
+      newQuestion.id = newQuestion.id || uid("sentence");
+      setQuestion(newQuestion);
     } catch (event) {
-      setError(event instanceof Error ? event.message : "Could not generate question.");
+      setError(event instanceof Error ? event.message : "Could not generate question. Please try again.");
     } finally {
       setLoading(false);
-    }
-  }
-
-  async function moveToNextQuestion() {
-    const remaining = showNextFromQueue(questionQueue);
-    if (!remaining.length) {
-      await loadQuestionBatch();
     }
   }
 
@@ -398,30 +372,38 @@ function SentencePractice({ state, setState }: { state: PracticeState; setState:
     });
     setSubmitted(true);
     setLastResult({ correct, answer: question.answer, explanation: question.explanation });
+    setQuestionsAnswered(questionsAnswered + 1);
+
+    // Auto-load next question after 2 seconds if not reached 20 yet
+    if (questionsAnswered + 1 < 20) {
+      setTimeout(() => {
+        loadNextQuestion();
+      }, 2000);
+    }
   }
 
   return (
     <div className="grid gap-5 lg:grid-cols-[320px_1fr]">
       <Panel title="AI Question Controls">
         <Select label="Difficulty" value={difficulty} onChange={(value) => setDifficulty(value as DifficultyFilter)} options={["Mixed", ...difficulties]} />
-        <button onClick={loadQuestionBatch} disabled={loading} className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-emerald-500 px-4 py-3 font-semibold text-white hover:bg-emerald-600 disabled:opacity-60">
-          <Sparkles size={18} /> {loading ? "Generating..." : "Generate 20 AI Questions"}
+        <button onClick={loadNextQuestion} disabled={loading || questionsAnswered >= 20} className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-emerald-500 px-4 py-3 font-semibold text-white hover:bg-emerald-600 disabled:opacity-60">
+          <Sparkles size={18} /> {loading ? "Generating..." : questionsAnswered === 0 ? "Start: Generate First Question" : `Next Question (${questionsAnswered}/20)`}
         </button>
-        <p className="text-sm text-slate-500 dark:text-slate-400">A batch of 20 is generated together. Timer is 30 seconds, and timed-out questions move forward without scoring.</p>
+        <p className="text-sm text-slate-500 dark:text-slate-400">One question at a time. Answer it, and the next one loads automatically! You'll complete 20 total.</p>
         {error && <p className="rounded-lg bg-rose-50 p-3 text-sm text-rose-700 dark:bg-rose-500/10 dark:text-rose-200">{error}</p>}
       </Panel>
 
       <Panel title="Sentence Completion">
         {loading && !question ? (
-          <EmptyLine text="Generating a batch of 20 AI questions..." />
+          <EmptyLine text={questionsAnswered === 0 ? "Generating your first question..." : "Loading next question..."} />
         ) : question ? (
           <div className="space-y-5">
             <div className="flex flex-wrap gap-2 text-xs">
               <Badge>{question.difficulty}</Badge>
               <Badge>{question.category}</Badge>
-              <Badge>{`${Math.max(questionQueue.length, 1)} in batch`}</Badge>
+              <Badge>{`Question ${questionsAnswered + 1} of 20`}</Badge>
             </div>
-            <Timer seconds={30} running={!submitted && !loading} resetKey={question.id} onEnd={moveToNextQuestion} />
+            <Timer seconds={30} running={!submitted && !loading} resetKey={question.id} onEnd={() => submit()} />
             <p className="text-xl font-semibold leading-relaxed">{question.prompt}</p>
             <div className="flex flex-col gap-3 sm:flex-row">
               <input
@@ -443,14 +425,17 @@ function SentencePractice({ state, setState }: { state: PracticeState; setState:
                   {lastResult.correct ? "Right" : "Wrong"} answer: {lastResult.answer}
                 </div>
                 <p className="text-sm text-slate-600 dark:text-slate-300">{lastResult.explanation}</p>
-                <button onClick={moveToNextQuestion} disabled={loading} className="mt-4 inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-4 py-2 text-sm font-semibold text-white hover:bg-emerald-600 disabled:opacity-60">
-                  <Sparkles size={16} /> Next AI Question
-                </button>
+                {questionsAnswered < 20 && (
+                  <p className="mt-2 text-xs text-slate-500">Next question loading automatically...</p>
+                )}
+                {questionsAnswered >= 20 && (
+                  <p className="mt-2 font-bold text-emerald-600">🎉 All 20 questions completed!</p>
+                )}
               </div>
             )}
           </div>
         ) : (
-          <EmptyLine text="Add your OpenRouter key, then generate 20 AI questions at once." />
+          <EmptyLine text="Add your OpenRouter key, then click 'Start' to generate your first question." />
         )}
       </Panel>
     </div>
